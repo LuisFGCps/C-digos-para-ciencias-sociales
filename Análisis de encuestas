@@ -1,0 +1,135 @@
+Este código lo utilicé varias veces para analizar datos de encuestas, primordialmente de INEGI, pero la lógica aplica para otras encuestas con datos abiertos.
+
+Para éste ejemplo se usarán los datos del archivo unificado de LAPOP (http://datasets.americasbarometer.org/database/index.php?freeUser=true).
+
+### Análisis de datos de encuestas (declaración de diseño muestral y medición de variables)
+#Se establece el directorio de trabajo y cargamos las paqueterías a usar. Recomiendo ampliamente el uso de la paquetería 'pacman' para simplificar este paso, ya que al usar el comando 'p_load' instalamos y cargamos las paqueterías  a usar. La única precaución es: escribir correctamente el nombre de las paqueterías, o se intentará hacer la carga de una paquetería inexistente.
+
+##Preparativo
+setwd("Tu directorio de trabajo") #Sustituye aquí el directorio de trabajo que usarás
+pacman::p_load(tidyverse, haven, survey)
+
+#Cargamos tidiverse por su gama de funciones para el análisis de datos para ciencias sociales
+#haven ayuda para la lectura y procesamiento de archivos tipo '.dta', comúnmente usados en Stata.
+#la paquetería survey es la más importante para esta lección, pues se contiene las funciones necesarias para procesar encuestas
+
+#Cargamos la base de datos
+BarAm <- read_dta("Grand_Merge_2004-2023_LAPOP_AmericasBarometer_v1.0_FREE.dta")
+#Adelanto que en esta base hay 61 casos sin información en la variable upm, la cual es de nuestro interés. No obstante, al revisarlos notamos que no tienen información registrada, por lo que podemos eliminarlos.
+sum(is.na(BarAm$upm))
+
+#Como en otras lecciones, es normal cometer errores. Por ello, para evitar alteraciones en las variables originales, crearemos variables nuevas.
+#Esto tiene un doble propósito: mantener los valores originales íntegros y codificar según nuestra conveniencia las variables de interés.
+
+#Primero, aprovechamos el formato de Stata para extraer la información sobre las variables.
+#Haremos esto mediante la función attr de haven, la cual permite obtener del mismo archivo las etiquetas de cada variable y entrada, como serían los nombres de los países.
+labels <- attr(BarAm$etid, "labels")
+labels
+
+#Después, generamos un subset para conservar únicamente las variables que necesitamos usar para la declaración del diseño muestral y aquellas que deseamos analizar
+
+#upm es nuestra Unidad Primaria de Muestreo (PSU, por sus siglas en inglés);
+#strata es la estratificación empleada dentro del diseño muestral;
+#weight1500 es el factor de expansión. En el caso de LAPOP, produce que la muestra represente a 1500 encuestados en cada país.
+#país serán las unidades que utilizaremos
+#year es para poder generar una base de datos tipo panel, por lo que las unidades serán país-año
+#b21 es la confianza en los partidos políticos y b21a es la confianza en el gobierno nacional
+
+#Estas últimas dos variables están codificadas en una escala de 1 a 7 donde 1 es Nada de confianza y 7 es Mucha confianza; 888888 es No sabe y 988888 es No responde.
+#Dado que no nos interesan los indecisos para este ejercicio, codificaremos ambas como NA.
+#Por su parte, codificaremos como variable categórica la escala en 'Nada' (de 1 a 4) y 'Mucho' (de 5 a 7).
+
+Barometro <- BarAm %>%
+  filter(!is.na(upm)) %>% #Aquí omitimos las filas con NA en upm
+  select(upm, strata, weight1500, pais, year,b21, b21a) %>% #Seleccionamos las variables deseadas
+  mutate(
+    pais = haven::as_factor(pais), # convierte etiquetas a factor
+    pais = forcats::fct_recode(pais, "Guyana" = "24"), #Guyana no estaba codificada, por lo que añadiremos su codificación. Quizá se necesite instalar esta paquetería previamente, pero como no ocurre siempre, se omitió en el preparativo.
+    Confia_Par = case_when(
+      b21 %in% 1:4 ~ "Nada",
+      b21 %in% 5:7 ~ "Mucho",
+      TRUE         ~ NA_character_
+    ),
+    Confia_Par = factor(Confia_Par,
+                        levels = c("Nada", "Mucho")), #Codificamos como categorías (factor) estas variables.
+    Confia_Gob = case_when(
+      b21a %in% 1:4 ~ "Nada",
+      b21a %in% 5:7 ~ "Mucho",
+      TRUE          ~ NA_character_
+    ),
+    Confia_Gob = factor(Confia_Gob,
+                        levels = c("Nada", "Mucho"))
+  )
+
+#Al momento de hacer las estimaciones se hallaron varios valores como 0 pese a que existan datos para los países a estimar, por lo que se ajustará para PSU solitarios
+options(survey.lonely.psu = "adjust")
+
+# Declarar diseño muestral con survey::svydesign
+#Se tiene que hacer un objeto adicional el cual guarda al diseño muestral. La lógica es que a este objeto será el conjunto de datos que usaremos para estimar y medir la información deseada, no a la base original.
+
+#Viendo la nota metodológica más reciente sobre el diseño muestral (https://www.vanderbilt.edu/lapop/ab2021/AB2021-Technical-Report-v1.0-FINAL-eng-030722.pdf), vemos que se trata de una muestra compleja.
+#Esto significa que está estratificada y agrupada por conglomerados.
+#En el caso de comparaciones entre países y años distintos, se tiene que usar la variable 'weight1500' tal como se muestra en el código
+
+America <- svydesign(ids = ~upm, #son los datos de identificación de los clusters o conglomerados de muestreo
+                     strata = ~strata, #Es la estratificación de las unidades de muestreo
+                     weights = ~weight1500, #Es el factor de expansión de la muestra. Es decir, la representatividad de una observación (un encuestado) en su respectiva unidad de análisis (en este caso, país-año)
+                     nest = TRUE, #Vuelve a etiquetar los datos de identificación de los clusters para forzar una anidación dentro de la estratificación.
+                     data = Barometro) #Es el objeto con los datos a analizar. Notese que es el que generamos y no la base original.
+
+
+#Ahora, podemos analizar casos específicos, por ejemplo la media ponderada de confianza hacia el gobierno en México en el 2008
+#Para ello, usaremos el comando svyby
+svyby(~Confia_Gob, #Primero incluimos la variable que nos interesa;
+      ~pais + year, #Agrupamos por las unidades que usamos en el ejercicio;
+      America, #Usamos el objeto de diseño muestral;
+      svymean, #El estadístico que nos interesa, en este caso, las proporciones de respuesta de la variable;
+      na.rm = TRUE, #Ignoramos los valores perdidos;
+      keep.var = FALSE) %>% #Como sólo nos interesa la media, omitimos que nos arroje la varianza de respuesta;
+  filter(pais == "México", year == 2008) #Y filtramos por el dato que nos interesa.
+
+#Los resultados deben ser los siguientes:
+#| pais | year | statistic.Confia_GobNada | statistic.Confia_GobMucho |
+#| México | 2008 | 0.423301 | 0.576699 | 
+
+#También podemos comparar varios países por año
+svyby(~Confia_Gob, 
+      ~pais + year, 
+      America, 
+      svymean, 
+      na.rm = TRUE, 
+      keep.var = FALSE) %>% 
+  filter(year == 2018)
+
+#Cuyos resultados deben ser
+#| pais | year | statistic.Confia_GobNada | statistic.Confia_GobMucho |
+#| El Salvador | 2018 | 0.7269076 | 0.2730924 |
+#| Honduras | 2018 | 0.7198444 | 0.2801556 |
+#| Colombia | 2018 | 0.5581962 | 0.4418038 |
+
+#svymean promedia las respuestas de cada encuestado en cada unidad. Al medir variables categóricas,
+#se generan promedios de respuesta por cada categoría
+#Si usaramos variables numéricas (como las originales), tendríamos el valor promedio por unidadd.
+#Por ejemplo, en vez de usar la 'Confia_Gob' usaramos 'b21a'
+
+svyby(~b21a 
+      ~pais + year, 
+      America, 
+      svymean, 
+      na.rm = TRUE, 
+      keep.var = FALSE) %>% 
+  filter(year == 2018)
+
+#Obtendríamos los siguientes resultados
+#| pais | year | statistic |
+#| El Salvador | 2018 | 3.047523 | 
+#| Honduras | 2018 | 2.913100 |
+#| Colombia | 2018 | 3.976843 |
+
+#Evidentemente, la interpretación sería distinta, pero entender esto nos ilustra que podemos
+#medir distintos tipos de variables y comparar únicamente entre países o años.
+
+###Ejercicios - Responde las siguientes preguntas:
+#1. ¿Cómo cambian el promedio de confianza (hacia los partidos y el gobierno) en México (o tu país de origen) a lo largo del tiempo?
+#2. ¿Cuáles son las unidades que más han confiado en los partidos políticos?
+#3. ¿De otra variable que te interese observar en la base original, cuál es la media de respuesta en un mismo país para dos periodos distintos?
